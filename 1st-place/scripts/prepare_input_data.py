@@ -1,8 +1,11 @@
+from pathlib import Path
+
 import ee
 import geemap
 import geopandas as gpd
 import mrv.crs
 import pandas as pd
+from shapely import box
 
 from client_utils import read_suzano_inventory
 from mrv.satellites.sentinel2 import maskCloudsS2
@@ -43,7 +46,9 @@ def inventory2carbon(vtcc, age, density=0.44, co2eq=False):
 
 if __name__ == "__main__":
     ee.Initialize(project="marvin-dmrv-dev")
-    data_dir = "/tmp/suzano_data"
+    data_dir = Path("/home/ubuntu/asaph/the-biomassters/1st-place/suzano_inputs/suzano_tifs2")
+
+    data_dir.mkdir(exist_ok=True, parents=True)
     # data_dir = "."
 
     suzano_inv = read_suzano_inventory().reset_index(["unf"])
@@ -75,13 +80,52 @@ if __name__ == "__main__":
     suzano_inv = suzano_inv[["unf", "measure_date", "age", "vtcc"]]
     suzano_inv.loc[:, "agbd"] = suzano_inv.apply(lambda x: inventory2carbon(x.vtcc, x.age, co2eq=False), axis=1)
 
-    for up in suzano_ups.sort_values("area", ascending=False).head(10).index:
+    subset = suzano_ups.sort_values("area", ascending=False).head(10)
+    subset_inv = suzano_inv.loc[subset.index]
+    subset_inv["chip_id"] = (
+        subset_inv.index.get_level_values("up") + "_" + subset_inv["measure_date"].dt.strftime("%Y-%m-%d")
+    )
+    subset_inv.to_csv("/home/ubuntu/asaph/the-biomassters/1st-place/suzano_inputs/suzano_meta.csv")
+
+    bounds = suzano_ups.to_crs(mrv.crs.PSEUDO_MERCATOR).bounds
+    bounds.loc[:, ["width"]] = bounds["maxx"] - bounds["minx"]
+    bounds.loc[:, ["height"]] = bounds["maxy"] - bounds["miny"]
+    bounds.loc[:, ["maxx_padded"]] = bounds["maxx"] + ((2560 - bounds["width"]) / 2)
+    bounds.loc[:, ["minx_padded"]] = bounds["minx"] - ((2560 - bounds["width"]) / 2)
+    bounds.loc[:, ["maxy_padded"]] = bounds["maxy"] + ((2560 - bounds["height"]) / 2)
+    bounds.loc[:, ["miny_padded"]] = bounds["miny"] - ((2560 - bounds["height"]) / 2)
+    bounds["boxes"] = bounds.apply(
+        lambda r: box(r["minx_padded"], r["miny_padded"], r["maxx_padded"], r["maxy_padded"]), axis=1
+    )
+    bounds = gpd.GeoDataFrame(bounds, geometry="boxes", crs=mrv.crs.PSEUDO_MERCATOR)
+    bounds = bounds.to_crs(mrv.crs.WGS84)
+
+    for up in subset.index:
         print(up, suzano_ups["area"].loc[up])
         ee_poly = geemap.gdf_to_ee(suzano_ups.loc[[up]])
+        ee_bbox = ee.Geometry.BBox(*bounds.loc[up].boxes.bounds)
         for mdate in suzano_inv.loc[up, "measure_date"]:
             start_date = mdate + pd.Timedelta(-180, "D")
+
             for i in range(12):
-                s2 = get_sentinel2(ee_poly, f"{start_date:%Y-%m-%d}", f'{start_date + pd.Timedelta(30, "D"):%Y-%m-%d}')
+
+                # Sentinel-2
+                s2 = get_sentinel2(
+                    ee_poly,
+                    f"{start_date:%Y-%m-%d}",
+                    f'{start_date + pd.Timedelta(30, "D"):%Y-%m-%d}',
+                    max_cloud_cover=50,
+                )
+
+                if i == 0:
+                    geemap.download_ee_image(
+                        ee_poly.reduceToImage(properties=["area"], reducer=ee.Reducer.first()).gt(0),
+                        f"{data_dir}/{up}_{mdate:%Y-%m-%d}_MASK.tif",
+                        region=ee_bbox,
+                        scale=10,
+                        crs=s2.first().select("B2").projection().crs().getInfo(),
+                    )
+
                 s2_median = s2.select(
                     [
                         "B2",
@@ -98,47 +142,47 @@ if __name__ == "__main__":
                     ]
                 ).median()
 
-                # s2_median_np = geemap.ee_to_numpy(
-                #     s2_median,
-                #     region=ee_poly,
-                #     scale=10
-                #     # crs=s2.first().select("B2").projection().crs().getInfo(),
-                # )
-                # print(s2_median_np.shape)
-
                 geemap.download_ee_image(
                     s2_median,
                     f"{data_dir}/{up}_{mdate:%Y-%m-%d}_S2_{i:0>2}.tif",
-                    region=ee_poly.geometry(),
+                    region=ee_bbox,
                     scale=10,
                     crs=s2.first().select("B2").projection().crs().getInfo(),
+                    # unmask_value=0,  todo: add unmask value?
                 )
 
-                # todo: there are almost no ascending S1 over Brazil (true?), always ignore or add .size().getInfo()?
-                # s1_ascending = get_sentinel1(
-                #     ee_poly,
-                #     f"{start_date:%Y-%m-%d}",
-                #     f'{start_date + pd.Timedelta(30, "D"):%Y-%m-%d}',
-                #     orbit='ASCENDING',
-                # ).median()
-
-                s1_descending = get_sentinel1(
+                # Sentinel-1
+                s1_desc = get_sentinel1(
                     ee_poly,
                     f"{start_date:%Y-%m-%d}",
                     f'{start_date + pd.Timedelta(30, "D"):%Y-%m-%d}',
                     orbit="DESCENDING",
                 )
+                if s1_desc.size().getInfo() > 0:
+                    s1_desc_median = s1_desc.median().select(["VV", "VH"], ["VV_DESCENDING", "VH_DESCENDING"])
 
-                s1_descending_median = s1_descending.median().select(["VV", "VH"], ["VV_DESCENDING", "VH_DESCENDING"])
+                    s1_asc = get_sentinel1(
+                        ee_poly,
+                        f"{start_date:%Y-%m-%d}",
+                        f'{start_date + pd.Timedelta(30, "D"):%Y-%m-%d}',
+                        orbit="ASCENDING",
+                    )
+                    if s1_asc.size().getInfo() > 0:
+                        s1_asc_median = s1_asc.median().select(["VV", "VH"], ["VV_ASCENDING", "VH_ASCENDING"])
+                    else:
+                        s1_asc_median = s1_desc_median.select(
+                            ["VV_DESCENDING", "VH_DESCENDING"], ["VV_ASCENDING", "VH_ASCENDING"]
+                        )
 
-                # s1 = s1_ascending.addBands(s1_descending)
-                if s1_descending.size().getInfo() > 0:
+                    s1 = s1_desc_median.addBands(s1_asc_median)
+
                     geemap.download_ee_image(
-                        s1_descending_median,
+                        s1,
                         f"{data_dir}/{up}_{mdate:%Y-%m-%d}_S1_{i:0>2}.tif",
-                        region=ee_poly.geometry(),
+                        region=ee_bbox,
                         scale=10,
-                        crs=s1_descending.first().select("VV").projection().crs().getInfo(),
+                        crs=s1_desc.first().select("VV").projection().crs().getInfo(),
+                        unmask_value=-9999,
                     )
 
-                start_date += pd.Timedelta(30, "D")
+                    start_date += pd.Timedelta(30, "D")

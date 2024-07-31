@@ -1,36 +1,99 @@
 import random
+from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
 from skimage import io
 
-
-s1_min = np.array([-25 , -62 , -25, -60], dtype="float32")
-s1_max = np.array([ 29 ,  28,  30,  22 ], dtype="float32")
+s1_min = np.array([-25, -62, -25, -60], dtype="float32")
+s1_max = np.array([29, 28, 30, 22], dtype="float32")
 s1_mm = s1_max - s1_min
 
 s2_max = np.array(
-    [19616., 18400., 17536., 17097., 16928., 16768., 16593., 16492., 15401., 15226.,   255.],
+    [19616.0, 18400.0, 17536.0, 17097.0, 16928.0, 16768.0, 16593.0, 16492.0, 15401.0, 15226.0, 255.0],
     dtype="float32",
 )
 
 IMG_SIZE = (256, 256)
 
 
+# def read_imgs(chip_id, data_dir):
+#     imgs, mask = [], []
+#     for month in range(12):
+#         img_s1 = io.imread(data_dir / f"{chip_id}_S1_{month:0>2}.tif")
+#         m = img_s1 == -9999
+#         img_s1 = img_s1.astype("float32")
+#         img_s1 = (img_s1 - s1_min) / s1_mm
+#         img_s1 = np.where(m, 0, img_s1)
+#         filepath = data_dir / f"{chip_id}_S2_{month:0>2}.tif"
+#         if filepath.is_file():
+#             img_s2 = io.imread(filepath)
+#             img_s2 = img_s2.astype("float32")
+#             img_s2 = img_s2 / s2_max
+#         else:
+#             img_s2 = np.zeros(IMG_SIZE + (11,), dtype="float32")
+#
+#         img = np.concatenate([img_s1, img_s2], axis=2)
+#         img = np.transpose(img, (2, 0, 1))
+#         imgs.append(img)
+#         mask.append(False)
+#
+#     mask = np.array(mask)
+#
+#     imgs = np.stack(imgs, axis=0)  # [t, c, h, w]
+#
+#     return imgs, mask
+
+
+def center_pad(im, target_h, target_w):
+    h, w = im.shape[:2]
+
+    pad_y = (target_h - h) // 2
+    pad_x = (target_w - w) // 2
+
+    pads = ((pad_y, pad_y + (target_h - h) % 2), (pad_x, pad_x + (target_w - w) % 2))
+    if im.ndim == 3:
+        pads += ((0, 0),)
+
+    return np.pad(im, pads)
+
+
 def read_imgs(chip_id, data_dir):
     imgs, mask = [], []
     for month in range(12):
-        img_s1 = io.imread(data_dir / f"{chip_id}_S1_{month:0>2}.tif")
-        m = img_s1 == -9999
-        img_s1 = img_s1.astype("float32")
-        img_s1 = (img_s1 - s1_min) / s1_mm
-        img_s1 = np.where(m, 0, img_s1)
+        s1_path = data_dir / f"{chip_id}_S1_{month:0>2}.tif"
+        if s1_path.is_file():
+            img_s1 = io.imread(s1_path)
+
+            # if img_s1.shape != (256, 256, 4):
+            #     img_s1 = np.moveaxis(img_s1, 0, 2)  # B, H, W -> H, W, B
+
+            m = img_s1 == -9999
+            img_s1 = img_s1.astype("float32")
+            img_s1 = (img_s1 - s1_min[: img_s1.shape[2]]) / s1_mm[: img_s1.shape[2]]
+            img_s1 = np.where(m, 0, img_s1)
+
+            if img_s1.shape != (256, 256, 4):
+                # img_s1 = np.dstack([img_s1, np.zeros_like(img_s1)])
+                img_s1 = center_pad(img_s1, *IMG_SIZE)
+        else:
+            img_s1 = np.zeros(IMG_SIZE + (4,), dtype="float32")
+
         filepath = data_dir / f"{chip_id}_S2_{month:0>2}.tif"
         if filepath.is_file():
             img_s2 = io.imread(filepath)
+
+            if img_s2.shape != (256, 256, 11):
+                img_s2 = np.moveaxis(img_s2, 0, 2)  # B, H, W -> H, W, B
+
+            m = np.isfinite(img_s2)
             img_s2 = img_s2.astype("float32")
             img_s2 = img_s2 / s2_max
+            img_s2 = np.where(m, img_s2, 0)
+
+            if img_s2.shape != (256, 256, 11):
+                img_s2 = center_pad(img_s2, *IMG_SIZE)
         else:
             img_s2 = np.zeros(IMG_SIZE + (11,), dtype="float32")
 
@@ -46,9 +109,21 @@ def read_imgs(chip_id, data_dir):
     return imgs, mask
 
 
+def read_shape_mask(chip_id, data_dir):
+    mask_path = data_dir / f"{chip_id}_MASK.tif"
+    mask = io.imread(mask_path)
+
+    if mask.shape != (256, 256, 4):
+        mask = center_pad(mask, *IMG_SIZE)
+
+    return mask
+
+
 def rotate_image(image, angle, rot_pnt, scale=1):
     rot_mat = cv2.getRotationMatrix2D(rot_pnt, angle, scale)
-    result = cv2.warpAffine(image, rot_mat, (image.shape[1], image.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101) #INTER_NEAREST
+    result = cv2.warpAffine(
+        image, rot_mat, (image.shape[1], image.shape[0]), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+    )  # INTER_NEAREST
 
     return result
 
@@ -69,15 +144,15 @@ def train_aug(imgs, mask, target):
     if random.random() > 0.3:  # scale-rotate
         _d = int(imgs.shape[2] * 0.1)  # 0.4)
         rot_pnt = (imgs.shape[2] // 2 + random.randint(-_d, _d), imgs.shape[3] // 2 + random.randint(-_d, _d))
-        #scale = 1
-        #if random.random() > 0.2:
-            #scale = random.normalvariate(1.0, 0.1)
+        # scale = 1
+        # if random.random() > 0.2:
+        # scale = random.normalvariate(1.0, 0.1)
 
-        #angle = 0
-        #if random.random() > 0.2:
+        # angle = 0
+        # if random.random() > 0.2:
         angle = random.randint(0, 90) - 45
 
-        if (angle != 0):# or (scale != 1):
+        if angle != 0:  # or (scale != 1):
             t = len(imgs)  # t, c, h, w
             imgs = np.concatenate(imgs, axis=0)  # t*c, h, w
             imgs = np.transpose(imgs, (1, 2, 0))  # h, w, t*c
@@ -114,7 +189,7 @@ class DS(torch.utils.data.Dataset):
 
         imgs, mask = read_imgs(item.chip_id, self.dir_features)
         if self.dir_labels is not None:
-            target = io.imread(self.dir_labels / f'{item.chip_id}_agbm.tif')
+            target = io.imread(self.dir_labels / f"{item.chip_id}_agbm.tif")
         else:
             target = item.chip_id
 
@@ -153,3 +228,17 @@ def predict_tta(models, images, masks, ntta=1):
     result /= n * len(models)
 
     return result
+
+
+if __name__ == "__main__":
+    test_features = Path(
+        "/home/ubuntu/.cache/huggingface/hub/datasets--nascetti-a--BioMassters/snapshots/b5ebba44f7eb0cfc5130a1a8ca77e3e740fbad8d/test_features"
+    )
+    test_chip = "679f1be1"
+
+    my_dir = Path("/home/ubuntu/asaph/the-biomassters/1st-place/suzano_inputs/suzano_tifs")
+    my_chip = "T8AN41_2023-03-10"
+
+    test_ims = read_imgs(test_chip, test_features)
+    my_ims = read_imgs(my_chip, my_dir)
+    print(my_ims)

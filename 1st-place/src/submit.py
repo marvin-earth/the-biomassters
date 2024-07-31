@@ -1,6 +1,8 @@
 import argparse
 import os
 
+import tifffile
+
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -46,7 +48,10 @@ def parse_args(args=None):
     )
 
     parser.add_argument(
-        "--num-workers", type=int, help="number of data loader workers", default=8,
+        "--num-workers",
+        type=int,
+        help="number of data loader workers",
+        default=8,
     )
     parser.add_argument("--batch-size", type=int, help="batch size", default=32)
 
@@ -76,7 +81,10 @@ def main():
     models = [model]
 
     df = pd.read_csv(args.test_df)
-    test_df = df[df.split == "test"].copy()
+    if "split" in df.columns:
+        test_df = df[df.split == "test"].copy()
+    else:
+        test_df = df
     test_df = test_df.groupby("chip_id").agg(list).reset_index()
     print(test_df)
 
@@ -112,9 +120,9 @@ def main():
                 logits = logits.squeeze(1).cpu().numpy()
 
                 for pred, chip_id in zip(logits, target):
-                    im = Image.fromarray(pred)
-                    im.save(out_dir / f"{chip_id}_agbm.tif", format="TIFF", save_all=True)
-
+                    # im = Image.fromarray(pred)
+                    # im.save(out_dir / f"{chip_id}_agbm.tif", format="TIFF", save_all=True)
+                    tifffile.imwrite(out_dir / f"{chip_id}_agbm.tif", pred)
                 torch.cuda.synchronize()
 
 
